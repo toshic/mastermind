@@ -11,7 +11,7 @@ def ts_str(ts):
     return time.asctime(time.localtime(ts))
 
 class Status(object):
-    INIT = 'INIT' 
+    INIT = 'INIT'
     OK = 'OK'
     COUPLED = 'COUPLED'
     BAD = 'BAD'
@@ -80,13 +80,9 @@ class NodeStat(object):
             self.write_rps = (self.last_write - prev.last_write)/dt
 
             # Disk usage should be used here instead of load average
-            self.max_read_rps = self.read_rps / self.load_average
-            if self.max_read_rps < 100:
-                self.max_read_rps = 100
+            self.max_read_rps = max(self.read_rps / self.load_average, 100)
 
-            self.max_write_rps = self.write_rps / self.load_average
-            if self.max_write_rps < 100:
-                self.max_write_rps = 100
+            self.max_write_rps = max(self.write_rps / self.load_average, 100)
 
         else:
             self.read_rps = 0
@@ -230,7 +226,7 @@ class Node(object):
         res['addr'] = self.__str__()
         res['status'] = self.status
         #res['stat'] = str(self.stat)
-        
+
         return res
 
     def __repr__(self):
@@ -244,7 +240,7 @@ class Node(object):
             raise Exception('Node object is destroyed')
 
         return '%s:%d' % (self.host.addr, self.port)
-        
+
     def __hash__(self):
         return hash(self.__str__())
 
@@ -257,6 +253,9 @@ class Node(object):
 
 
 class Group(object):
+
+    DEFAULT_NAMESPACE = 'default'
+
     def __init__(self, group_id, nodes=None):
         self.group_id = group_id
         self.status = Status.INIT
@@ -271,7 +270,7 @@ class Group(object):
 
     def add_node(self, node):
         self.nodes.append(node)
-        
+
     def has_node(self, node):
         return node in self.nodes
 
@@ -286,7 +285,7 @@ class Group(object):
 
         parsed = msgpack.unpackb(meta)
         if isinstance(parsed, tuple):
-            self.meta = {'version': 1, 'couple': parsed}
+            self.meta = {'version': 1, 'couple': parsed, 'namespace': self.DEFAULT_NAMESPACE}
         elif isinstance(parsed, dict) and parsed['version'] == 2:
             self.meta = parsed
         else:
@@ -306,8 +305,7 @@ class Group(object):
             self.status_text = "Group %s is in INIT state because there is no coupling info" % (self.__str__())
             return self.status
 
-        statuses_dict = dict(((node, node.update_status()) for node in self.nodes))
-        statuses = tuple(statuses_dict.itervalues())
+        statuses = tuple(node.update_status() for node in self.nodes)
 
         if Status.RO in statuses:
             self.status = Status.RO
@@ -317,7 +315,7 @@ class Group(object):
         if not all([st == Status.OK for st in statuses]):
             self.status = Status.BAD
             self.status_text = "Group %s is in Bad state because some node statuses are not OK" % (self.__str__())
-            return
+            return self.status
 
         if (not self.couple) and self.meta['couple']:
             self.status = Status.BAD
@@ -327,6 +325,16 @@ class Group(object):
         elif not self.couple.check_groups(self.meta['couple']):
             self.status = Status.BAD
             self.status_text = "Group %s is in Bad state because couple check fails" % (self.__str__())
+            return self.status
+
+        elif not self.meta['namespace']:
+            self.status = Status.BAD
+            self.status_text = "Group %s is in Bad state because no namespace has been assigned to it" % (self.__str__())
+            return self.status
+
+        elif self.meta['namespace'] != self.couple.namespace:
+            self.status = Status.BAD
+            self.status_text = "Group %s is in Bad state because its namespace doesn't correspond to couple namespace (%s)" % (self.__str__(), self.couple.namespace)
             return self.status
 
         self.status = Status.COUPLED
@@ -344,6 +352,8 @@ class Group(object):
             res['couples'] = self.couple.as_tuple()
         else:
             res['couples'] = None
+        if self.meta:
+            res['namespace'] = self.meta['namespace']
 
         return res
 
@@ -425,8 +435,20 @@ class Couple(object):
         self.groups = []
         self.status = Status.INIT
 
+    def compose_meta(self, namespace):
+        return {
+            'version': 2,
+            'couple': self.as_tuple(),
+            'namespace': namespace,
+        }
+
+    @property
+    def namespace(self):
+        assert self.groups
+        return self.groups[0].meta['namespace']
+
     def as_tuple(self):
-        return tuple((group.group_id for group in self.groups))
+        return tuple(group.group_id for group in self.groups)
 
     def __contains__(self, group):
         return group in self.groups

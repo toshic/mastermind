@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import elliptics
 
+import balancer
 import balancelogicadapter as bla
 import timed_queue
 import threading
@@ -8,7 +9,6 @@ import traceback
 import time
 import storage
 
-symmetric_groups_key = "metabalancer\0symmetric_groups"
 mastermind_max_group_key = "mastermind:max_group"
 
 __config = {}
@@ -27,7 +27,6 @@ def get_config_value(key, default):
 
 class NodeInfoUpdater:
     def __init__(self, logging, node):
-        global _tq
         logging.info("Created NodeInfoUpdater")
         self.__logging = logging
         self.__node = node
@@ -69,31 +68,30 @@ class NodeInfoUpdater:
         try:
             self.__logging.info("Trying to read symmetric groups from group %d" % (group.group_id))
             self.__session.add_groups([group.group_id])
-            meta = self.__session.read_data(symmetric_groups_key)
+            meta = self.__session.read_data(balancer.SYMMETRIC_GROUPS_KEY)
             group.parse_meta(meta)
             couples = group.meta['couple']
-            self.__logging.info("Read symmetric groups from group %d: %s" % (group.group_id, str(couples)))
+            self.__logging.info("Read symmetric groups from group %d: %s" % (group.group_id, couples))
             for group_id2 in couples:
                 if group_id2 != group.group_id:
-                    self.__logging.info("Scheduling update for group %d" % group_id2)
+                    self.__logging.info("Scheduling update for group %s" % group_id2)
                     self.__tq.hurry(get_symm_group_update_task_id(group_id2))
 
-                    if not group_id2 in storage.groups:
-                        self.__logging.info("Group %d doesn't exist in all_groups, add fake data with couples=%s" % (group_id2, str(couples)))
-                        storage.groups.add(group_id2)
-
             couple_str = ':'.join((str(g) for g in sorted(couples)))
-            self.__logging.info(couple_str + ' in storage.couples: ' + str( couple_str in storage.couples))
-            self.__logging.info('Keys in storage.couples: %s' % (str([str(c) for c in storage.couples])))
+            self.__logging.info('%s in storage.couples: %s' % (couple_str, couple_str in storage.couples))
+            self.__logging.info('Keys in storage.couples: %s' % [str(c) for c in storage.couples])
+
             if not couple_str in storage.couples:
                 self.__logging.info("Creating couple %s" % (couple_str))
+                for gid in couples:
+                    if not gid in storage.groups:
+                        self.__logging.info("Group %s doesn't exist in all_groups, add fake data with couples=%s" % (gid, couples))
+                        storage.groups.add(gid)
                 c = storage.couples.add([storage.groups[gid] for gid in couples])
-                self.__logging.info("Created couple %s %s" % (str(c), repr(c)))
+                self.__logging.info("Created couple %s %s" % (c, repr(c)))
             else:
-                self.__logging.info("Couple %s already exists" % (couple_str))
+                self.__logging.info("Couple %s already exists" % couple_str)
             storage.couples[couple_str].update_status()
-
-            group.update_status()
         except Exception as e:
             self.__logging.error("Failed to read symmetric_groups from group %d (%s), %s" % (group.group_id, str(e), traceback.format_exc()))
             group.parse_meta(None)

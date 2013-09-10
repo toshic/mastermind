@@ -14,6 +14,7 @@ __config = {}
 __config_lock = threading.Lock()
 
 def setConfig(mastermind_config):
+    global __config
     lconfig = {}
     lconfig["MinimumFreeSpaceInKbToParticipate"] = mastermind_config.get("min_free_space", 256) * 1024
     lconfig["MinimumFreeSpaceRelativeToParticipate"] = mastermind_config.get("min_free_space_relative", 0.15)
@@ -27,7 +28,6 @@ def setConfig(mastermind_config):
     lconfig["WeightMultiplierHead"] = mastermind_config.get("multiplier_head", 1000000)
     lconfig["WeightMultiplierTail"] = mastermind_config.get("multiplier_tail", 600000)
     lconfig["MinimumWeight"] = mastermind_config.get("min_weight", 10000)
-    global __config
     with __config_lock:
         __config = lconfig
 
@@ -36,12 +36,26 @@ def getConfig():
         return copy.copy(__config)
 
 def setConfigValue(key, value):
-    global __config
     with __config_lock:
         __config[key] = value
 
 def GroupSizeEquals(size):
     return lambda symm_group, size=size: len(symm_group.unitId()) == size
+
+
+def GroupNamespaceEquals(namespace):
+    return lambda symm_group, namespace=namespace: symm_group.namespace == namespace
+
+
+def _and(*lambdas):
+    def combined(x):
+        for l in lambdas:
+            if not l(x):
+                return False
+        return True
+
+    return combined
+
 
 class SymmGroup:
     def __init__(self, couple):
@@ -72,6 +86,10 @@ class SymmGroup:
 
     def unitId(self):
         return tuple([g.group_id for g in self.couple.groups])
+
+    @property
+    def namespace(self):
+        return self.couple.namespace
 
     def inService(self):
         return False
