@@ -1,0 +1,4 @@
+
+
+class MinionApiError(Exception):
+    pass

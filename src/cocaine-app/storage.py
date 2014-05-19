@@ -1,22 +1,40 @@
 # -*- coding: utf-8 -*-
-
+import datetime
+import logging
 import time
-import socket
 import traceback
+
 import msgpack
 
 import inventory
+from infrastructure import infrastructure, port_to_path
+from config import config
+
+
+logger = logging.getLogger('mm.storage')
+
+
+RPS_FORMULA_VARIANT = config.get('rps_formula', 0)
+
 
 def ts_str(ts):
     return time.asctime(time.localtime(ts))
 
+
 class Status(object):
     INIT = 'INIT'
     OK = 'OK'
+    FULL = 'FULL'
     COUPLED = 'COUPLED'
     BAD = 'BAD'
     RO = 'RO'
     STALLED = 'STALLED'
+    FROZEN = 'FROZEN'
+
+
+GOOD_STATUSES = set([Status.OK, Status.FULL])
+NOT_BAD_STATUSES = set([Status.OK, Status.FULL, Status.FROZEN])
+
 
 class Repositary(object):
     def __init__(self, constructor):
@@ -46,6 +64,9 @@ class Repositary(object):
     def __repr__(self):
         return '<Repositary object: [%s] >' % (', '.join((repr(e) for e in self.elements.itervalues())))
 
+    def keys(self):
+        return self.elements.keys()
+
 
 class NodeStat(object):
     def __init__(self, raw_stat=None, prev=None):
@@ -62,27 +83,65 @@ class NodeStat(object):
             self.max_read_rps = 0
             self.max_write_rps = 0
 
+            self.fragmentation = 0.0
+            self.files = 0
+            self.files_removed = 0
+
+            self.fsid = None
+
+    def max_rps(self, rps, load_avg, variant=RPS_FORMULA_VARIANT):
+
+        if variant == 0:
+            return max(rps / max(load_avg, 0.01), 100)
+
+        rps = max(rps, 1)
+        max_avg_norm = 10.0
+        avg = max(min(float(load_avg), 100.0), 0.0) / max_avg_norm
+        avg_inverted = 10.0 - avg
+
+        if variant == 1:
+            max_rps = ((rps + avg_inverted) ** 2) / rps
+        elif variant == 2:
+            max_rps = ((avg_inverted) ** 2) / rps
+        else:
+            raise ValueError('Unknown max_rps option: %s' % variant)
+
+        return max_rps
+
     def init(self, raw_stat, prev=None):
         self.ts = time.time()
 
-        self.last_read = raw_stat["storage_commands"]["READ"][0] + raw_stat["proxy_commands"]["READ"][0]
-        self.last_write = raw_stat["storage_commands"]["WRITE"][0] + raw_stat["proxy_commands"]["WRITE"][0]
+        self.last_read = raw_stat['storage_commands']['READ'][0] + raw_stat['proxy_commands']['READ'][0]
+        self.last_write = raw_stat['storage_commands']['WRITE'][0] + raw_stat['proxy_commands']['WRITE'][0]
 
         self.total_space = float(raw_stat['counters']['DNET_CNTR_BLOCKS'][0]) * raw_stat['counters']['DNET_CNTR_BSIZE'][0]
         self.free_space = float(raw_stat['counters']['DNET_CNTR_BAVAIL'][0]) * raw_stat['counters']['DNET_CNTR_BSIZE'][0]
+        self.used_space = self.total_space - self.free_space
         self.rel_space = float(raw_stat['counters']['DNET_CNTR_BAVAIL'][0]) / raw_stat['counters']['DNET_CNTR_BLOCKS'][0]
-        self.load_average = float((raw_stat['counters'].get('DNET_CNTR_DU1') or raw_stat['counters']["DNET_CNTR_LA1"])[0]) / 100
+        self.load_average = (float(raw_stat['counters']['DNET_CNTR_DU1'][0]) / 100
+                             if raw_stat['counters'].get('DNET_CNTR_DU1') else
+                             float(raw_stat['counters']['DNET_CNTR_LA1'][0]) / 100)
+
+        self.fragmentation = (float(raw_stat['counters']['DNET_CNTR_NODE_FILES_REMOVED'][0]) /
+                                 ((raw_stat['counters']['DNET_CNTR_NODE_FILES'][0] +
+                                   raw_stat['counters']['DNET_CNTR_NODE_FILES_REMOVED'][0]) or 1))
+        self.files = raw_stat['counters']['DNET_CNTR_NODE_FILES'][0]
+        self.files_removed = raw_stat['counters']['DNET_CNTR_NODE_FILES_REMOVED'][0]
+
+        self.fsid = raw_stat['counters']['DNET_CNTR_FSID'][0]
 
         if prev:
             dt = self.ts - prev.ts
 
-            self.read_rps = (self.last_read - prev.last_read)/dt
-            self.write_rps = (self.last_write - prev.last_write)/dt
+            self.read_rps = (self.last_read - prev.last_read) / dt
+            self.write_rps = (self.last_write - prev.last_write) / dt
 
             # Disk usage should be used here instead of load average
-            self.max_read_rps = max(self.read_rps / self.load_average, 100)
+            # self.max_read_rps = max(self.read_rps / max(self.load_average, 0.01), 100)
+            self.max_read_rps = self.max_rps(self.read_rps, self.load_average)
 
-            self.max_write_rps = max(self.write_rps / self.load_average, 100)
+            # self.max_write_rps = max(self.write_rps / max(self.load_average, 0.01), 100)
+            self.max_write_rps = self.max_rps(self.write_rps, self.load_average)
 
         else:
             self.read_rps = 0
@@ -100,6 +159,7 @@ class NodeStat(object):
 
         res.total_space = self.total_space + other.total_space
         res.free_space = self.free_space + other.free_space
+        res.used_space = self.used_space + other.used_space
         res.rel_space = min(self.rel_space, other.rel_space)
         res.load_average = max(self.load_average, other.load_average)
 
@@ -109,6 +169,10 @@ class NodeStat(object):
         res.max_read_rps = self.max_read_rps + other.max_read_rps
         res.max_write_rps = self.max_write_rps + other.max_write_rps
 
+        res.files = self.files + other.files
+        res.files_removed = self.files_removed + other.files_removed
+        res.fragmentation = float(res.files_removed) / (res.files_removed + res.files or 1)
+
         return res
 
     def __mul__(self, other):
@@ -117,6 +181,7 @@ class NodeStat(object):
 
         res.total_space = min(self.total_space, other.total_space)
         res.free_space = min(self.free_space, other.free_space)
+        res.used_space = min(self.used_space, other.used_space)
         res.rel_space = min(self.rel_space, other.rel_space)
         res.load_average = max(self.load_average, other.load_average)
 
@@ -126,10 +191,26 @@ class NodeStat(object):
         res.max_read_rps = min(self.max_read_rps, other.max_read_rps)
         res.max_write_rps = min(self.max_write_rps, other.max_write_rps)
 
+        # files and files_removed are taken from the stat object with maximum
+        # total number of keys. If total number of keys is equal,
+        # the stat object with larger number of removed keys is more up-to-date
+        files_stat = max(self, other, key=lambda stat: (stat.files + stat.files_removed, stat.files_removed))
+        res.files = files_stat.files
+        res.files_removed = files_stat.files_removed
+
+        # ATTENTION: fragmentation coefficient in this case would not necessary
+        # be equal to [removed keys / total keys]
+        res.fragmentation = max(self.fragmentation, other.fragmentation)
+
         return res
 
     def __repr__(self):
-        return '<NodeStat object: ts=%s, write_rps=%d, max_write_rps=%d, read_rps=%d, max_read_rps=%d, total_space=%d, free_space=%d>' % (ts_str(self.ts), self.write_rps, self.max_write_rps, self.read_rps, self.max_read_rps, self.total_space, self.free_space)
+        return ('<NodeStat object: ts=%s, write_rps=%d, max_write_rps=%d, read_rps=%d, '
+                'max_read_rps=%d, total_space=%d, free_space=%d, files_removed=%s, '
+                'fragmentation=%s, load_average=%s>' % (
+                    ts_str(self.ts), self.write_rps, self.max_write_rps, self.read_rps,
+                    self.max_read_rps, self.total_space, self.free_space, self.files_removed,
+                    self.fragmentation, self.load_average))
 
 
 class Host(object):
@@ -137,15 +218,21 @@ class Host(object):
         self.addr = addr
         self.nodes = []
 
+    @property
     def hostname(self):
-        return socket.gethostbyaddr(self.addr)[0]
+        return infrastructure.get_hostname_by_addr(self.addr)
 
+    @property
+    def dc(self):
+        return infrastructure.get_dc_by_host(self.addr)
+
+    @property
+    def parents(self):
+        return infrastructure.get_host_tree(
+            infrastructure.get_hostname_by_addr(self.addr))
 
     def index(self):
         return self.__str__()
-
-    def get_dc(self):
-        return inventory.get_dc_by_host(self.addr)
 
     def __eq__(self, other):
         if isinstance(other, str):
@@ -160,18 +247,18 @@ class Host(object):
         return hash(self.__str__())
 
     def __repr__(self):
-        return '<Host object: addr=%s, nodes=[%s] >' % (self.addr, ', '.join((repr(n) for n in self.nodes)))
+        return ('<Host object: addr=%s, nodes=[%s] >' %
+                (self.addr, ', '.join((repr(n) for n in self.nodes))))
 
     def __str__(self):
         return self.addr
 
+
 class Node(object):
-    def __init__(self, host, port, group):
+    def __init__(self, host, port):
         self.host = host
         self.port = int(port)
-        self.group = group
         self.host.nodes.append(self)
-        self.group.add_node(self)
 
         self.stat = None
 
@@ -180,7 +267,6 @@ class Node(object):
         self.status = Status.INIT
         self.status_text = "Node %s is not inititalized yet" % (self.__str__())
 
-
     def get_host(self):
         return self.host
 
@@ -188,7 +274,8 @@ class Node(object):
         self.destroyed = True
         self.host.nodes.remove(self)
         self.host = None
-        self.group.remove_node(self)
+        # if there is a group using this node, remove node from the list
+        # self.group.remove_node(self)
 
     def update_statistics(self, new_stat):
         stat = NodeStat(new_stat, self.stat)
@@ -215,17 +302,31 @@ class Node(object):
             self.status = Status.OK
             self.status_text = "Node %s is OK" % (self.__str__())
 
-        #if self.group.group_id == 1:
-        #    print 'Update status: ', repr(self)
-
         return self.status
 
     def info(self):
         res = {}
 
         res['addr'] = self.__str__()
+        res['hostname'] = infrastructure.get_hostname_by_addr(self.host.addr)
         res['status'] = self.status
-        #res['stat'] = str(self.stat)
+        res['dc'] = self.host.dc
+        res['last_stat_update'] = (self.stat and
+            datetime.datetime.fromtimestamp(self.stat.ts).strftime('%Y-%m-%d %H:%M:%S') or
+            'unknown')
+        if self.stat:
+            min_free_space = config['balancer_config'].get('min_free_space', 256) * 1024 * 1024
+            min_free_space_rel = config['balancer_config'].get('min_free_space_relative', 0.15)
+
+            res['free_space'] = int(self.stat.free_space)
+            node_eff_space = max(min(self.stat.total_space - min_free_space,
+                                     self.stat.total_space * (1 - min_free_space_rel)), 0.0)
+
+            res['free_effective_space'] = int(max(self.stat.free_space - (self.stat.total_space - node_eff_space), 0))
+            res['used_space'] = int(self.stat.used_space)
+            res['total_files'] = self.stat.files + self.stat.files_removed
+            res['fragmentation'] = self.stat.fragmentation
+        res['path'] = port_to_path(int(res['addr'].split(':')[1]))
 
         return res
 
@@ -233,7 +334,7 @@ class Node(object):
         if self.destroyed:
             return '<Node object: DESTROYED!>'
 
-        return '<Node object: host=%s, port=%d, group=%s, status=%s, read_only=%s, stat=%s>' % (str(self.host), self.port, str(self.group), self.status, str(self.read_only), repr(self.stat))
+        return '<Node object: host=%s, port=%d, status=%s, read_only=%s, stat=%s>' % (str(self.host), self.port, self.status, str(self.read_only), repr(self.stat))
 
     def __str__(self):
         if self.destroyed:
@@ -249,7 +350,7 @@ class Node(object):
             return self.__str__() == other
 
         if isinstance(other, Node):
-            return self.addr == other.addr and self.port == other.port
+            return self.host.addr == other.host.addr and self.port == other.port
 
 
 class Group(object):
@@ -294,18 +395,25 @@ class Group(object):
     def get_stat(self):
         return reduce(lambda res, x: res + x, [node.stat for node in self.nodes])
 
+    def update_status_recursive(self):
+        if self.couple:
+            self.couple.update_status()
+        else:
+            self.update_status()
+
     def update_status(self):
         if not self.nodes:
             self.status = Status.INIT
             self.status_text = "Group %s is in INIT state because there is no nodes serving this group" % (self.__str__())
 
-        logging.info('In group %d meta = %s' % (self.group_id, str(self.meta)))
+        # node statuses should be updated before group status is set
+        statuses = tuple(node.update_status() for node in self.nodes)
+
+        logger.info('In group %d meta = %s' % (self.group_id, str(self.meta)))
         if (not self.meta) or (not 'couple' in self.meta) or (not self.meta['couple']):
             self.status = Status.INIT
             self.status_text = "Group %s is in INIT state because there is no coupling info" % (self.__str__())
             return self.status
-
-        statuses = tuple(node.update_status() for node in self.nodes)
 
         if Status.RO in statuses:
             self.status = Status.RO
@@ -345,6 +453,7 @@ class Group(object):
     def info(self):
         res = {}
 
+        res['id'] = self.group_id
         res['status'] = self.status
         res['status_text'] = self.status_text
         res['nodes'] = [n.info() for n in self.nodes]
@@ -369,10 +478,12 @@ class Group(object):
     def __eq__(self, other):
         return self.group_id == other
 
+
 class Couple(object):
     def __init__(self, groups):
         self.status = Status.INIT
         self.groups = sorted(groups, key=lambda group: group.group_id)
+        self.meta = None
         for group in self.groups:
             if group.couple:
                 raise Exception('Group %s is already in couple' % (repr(group)))
@@ -388,13 +499,26 @@ class Couple(object):
     def update_status(self):
         statuses = [group.update_status() for group in self.groups]
 
+        if self.meta and self.meta.get('frozen', False):
+            self.status = Status.FROZEN
+            return self.status
+
         meta = self.groups[0].meta
         if any([meta != group.meta for group in self.groups]):
             self.status = Status.BAD
             return self.status
 
         if all([st == Status.COUPLED for st in statuses]):
-            self.status = Status.OK
+            min_free_space = config['balancer_config'].get('min_free_space', 256) * 1024 * 1024
+            min_rel_space = config['balancer_config'].get('min_free_space_relative', 0.15)
+
+            stats = self.get_stat()
+            if (stats and (stats.free_space < min_free_space or
+                           stats.rel_space < min_rel_space)):
+                self.status = Status.FULL
+            else:
+                self.status = Status.OK
+
             return self.status
 
         if Status.INIT in statuses:
@@ -426,6 +550,35 @@ class Couple(object):
 
         return True
 
+    def parse_meta(self, meta):
+        if meta is None:
+            self.meta = None
+            return
+
+        meta = msgpack.unpackb(meta)
+        if meta['version'] == 1:
+            self.meta = meta
+        else:
+            raise ValueError('Unable to parse couple meta')
+
+    def freeze(self):
+        if not self.meta:
+            self.meta = self.compose_meta()
+        self.meta['frozen'] = True
+
+    def unfreeze(self):
+        if not self.meta:
+            self.meta = self.compose_meta()
+        self.meta['frozen'] = False
+
+    @property
+    def frozen(self):
+        return self.meta and self.meta['frozen']
+
+    @property
+    def closed(self):
+        return self.status == Status.FULL
+
     def destroy(self):
         for group in self.groups:
             group.couple = None
@@ -435,7 +588,13 @@ class Couple(object):
         self.groups = []
         self.status = Status.INIT
 
-    def compose_meta(self, namespace):
+    def compose_meta(self, frozen=False):
+        meta = {'version': 1}
+        if frozen:
+            meta['frozen'] = True
+        return meta
+
+    def compose_group_meta(self, namespace):
         return {
             'version': 2,
             'couple': self.as_tuple(),
@@ -444,11 +603,42 @@ class Couple(object):
 
     @property
     def namespace(self):
-        assert self.groups
-        return self.groups[0].meta['namespace']
+        assert self.groups, "Couple %s has empty group list (id: %s)" % (repr(self), id(self))
+        available_metas = [group.meta for group in self.groups
+                           if group.meta]
+
+        if not available_metas:
+            # could not read meta data from any group
+            return None
+
+        assert all(['namespace' in meta
+                    for meta in available_metas]), "Couple %s has broken namespace settings" % (repr(self),)
+        assert all([meta['namespace'] == available_metas[0]['namespace']
+                    for meta in available_metas]), "Couple %s has broken namespace settings" % (repr(self),)
+
+        return available_metas[0]['namespace']
 
     def as_tuple(self):
         return tuple(group.group_id for group in self.groups)
+
+    def info(self):
+        res = {'couple_status': self.status,
+               'id': str(self),
+               'tuple': self.as_tuple(),
+               'namespace': self.namespace}
+        stat = self.get_stat()
+        if stat:
+            min_free_space = config['balancer_config'].get('min_free_space', 256) * 1024 * 1024
+            min_free_space_rel = config['balancer_config'].get('min_free_space_relative', 0.15)
+
+            res['free_space'] = int(stat.free_space)
+            node_eff_space = max(min(stat.total_space - min_free_space,
+                                     stat.total_space * (1 - min_free_space_rel)), 0.0)
+
+            res['free_effective_space'] = int(max(stat.free_space - (stat.total_space - node_eff_space), 0))
+
+            res['used_space'] = int(stat.used_space)
+        return res
 
     def __contains__(self, group):
         return group in self.groups
@@ -476,54 +666,76 @@ class Couple(object):
         return '<Couple object: status=%s, groups=[%s] >' % (self.status, ', '.join([repr(g) for g in self.groups]))
 
 
-
 hosts = Repositary(Host)
 groups = Repositary(Group)
 nodes = Repositary(Node)
 couples = Repositary(Couple)
 
-from cocaine.logging import Logger
-logging = Logger()
+
+def stat_result_entry_to_dict(sre):
+    cnt = sre.statistics.counters
+    stat = {'group_id': sre.address.group_id,
+            'addr': '{0}:{1}'.format(sre.address.host, sre.address.port)}
+    stat.update(sre.statistics.counters)
+    return stat
+
+
 def update_statistics(stats):
+
+    if getattr(stats, 'get', None):
+        stats = [stat_result_entry_to_dict(sre) for sre in stats.get()]
+
     for stat in stats:
-        logging.info("Stats: %s %s" % (str(stat['group_id']), stat['addr']))
+        logger.info("Stats: %s %s" % (str(stat['group_id']), stat['addr']))
+
         try:
+
+            gid = stat['group_id']
+
             if not stat['addr'] in nodes:
                 addr = stat['addr'].split(':')
                 if not addr[0] in hosts:
                     host = hosts.add(addr[0])
-                    logging.debug('Adding host %s' % (addr[0]))
+                    logger.debug('Adding host %s' % (addr[0]))
                 else:
                     host = hosts[addr[0]]
 
-                if not stat['group_id'] in groups:
-                    group = groups.add(stat['group_id'])
-                    logging.debug('Adding group %d' % stat['group_id'])
-                else:
-                    group = groups[stat['group_id']]
+                nodes.add(host, addr[1])
 
-                n = nodes.add(host, addr[1], group)
-                logging.debug('Adding node %d -> %s:%s' % (stat['group_id'], addr[0], addr[1]))
+            if not gid in groups:
+                group = groups.add(gid)
+                logger.debug('Adding group %d' % stat['group_id'])
+            else:
+                group = groups[gid]
+
+            logger.info('Stats for node %s' % gid)
 
             node = nodes[stat['addr']]
-            if node.group.group_id != stat['group_id']:
-                raise Exception('Node group_id = %d, group_id from stat: %d' % (node.group.group_id, stat['group_id']))
 
-            logging.info('Updating statistics for node %s' % (str(node)))
+            if not node in group.nodes:
+                group.add_node(node)
+                logger.debug('Adding node %d -> %s:%s' %
+                              (gid, node.host.addr, node.port))
+
+
+            logger.info('Updating statistics for node %s' % (str(node)))
             node.update_statistics(stat)
-            logging.info('Updating status for group %d' % (stat['group_id']))
-            groups[stat['group_id']].update_status()
+            logger.info('Updating status for group %d' % gid)
+            groups[gid].update_status()
 
         except Exception as e:
-            logging.error('Unable to process statictics for node %s group_id %d: %s' % (stat['addr'], stat['group_id'], traceback.format_exc()))
+            logger.error('Unable to process statictics for node %s group_id %d (%s): %s' % (stat['addr'], stat['group_id'], e, traceback.format_exc()))
+
 
 '''
 h = hosts.add('95.108.228.31')
 g = groups.add(1)
-n = nodes.add(hosts['95.108.228.31'], 1025, groups[1])
+n = nodes.add(hosts['95.108.228.31'], 1025)
+g.add_node(n)
 
 g2 = groups.add(2)
-nodes.add(h, 1026, g2)
+n2 = nodes.add(h, 1026)
+g2.add_node(n2)
 
 couple = couples.add([g, g2])
 
